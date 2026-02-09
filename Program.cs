@@ -5,7 +5,7 @@ namespace JFSI_MissingMusic_Downloader;
 
 internal static class Program
 {
-    private const int NoOfThreadsToOpenAtOnce = 50;
+    private const int SimultaneousDownloads = 50;
 
     private static void Main(string[] args)
     {
@@ -25,15 +25,12 @@ internal static class Program
     private static void ProcessFilesInFolder(string folderPath)
     {
         var files = Directory.GetFiles(folderPath, "*.json");
-        var tasks = new List<Task>();
-        foreach (var task in files.Select(file => new Task(() => { ProcessFile(file); })))
+        foreach (var file in files)
         {
-            task.Start();
-            tasks.Add(task);
+            Console.WriteLine("Processing file {0}", file);
+            ProcessFile(file);
+            Console.WriteLine("Finished processing file {0}", file);
         }
-
-        if (tasks.Count <= NoOfThreadsToOpenAtOnce)
-            Task.WhenAll(tasks).Wait();
     }
 
     private static void ProcessFile(string filePath)
@@ -44,20 +41,16 @@ internal static class Program
             var missingTracks = JsonConvert.DeserializeObject<List<MissingMusicObj>>(fileContents);
             if (missingTracks == null) return;
 
-            var dupTracks = missingTracks.Where(t =>
-                File.Exists("/home/matthew/Videos/YT/" + t.Name + " " + t.ArtistNames[0] + ".webm") ||
-                File.Exists("/home/matthew/Videos/YT/" + t.Name + " " + t.ArtistNames[0] + ".mp3"));
-            var tracksToDownload = missingTracks.Where(mt => !dupTracks.Contains(mt)).ToList();
-
-            var tasks = new List<Task>();
-            foreach (var task in tracksToDownload.Select(track => new Task(async () => { RunCommand(track); })))
+            var downloadedCount = 0;
+            while (downloadedCount < missingTracks.Count)
             {
-                task.Start();
-                tasks.Add(task);
-            }
-
-            if (tasks.Count <= NoOfThreadsToOpenAtOnce)
+                var indexToWorkTo = Math.Clamp(downloadedCount + SimultaneousDownloads + 1, 0, missingTracks.Count);
+                var currentIndex = Math.Clamp(downloadedCount, 0, missingTracks.Count);
+                var tasks = missingTracks.GetRange(currentIndex, indexToWorkTo)
+                    .Select(track => Task.Run(() => RunCommand(track))).ToList();
                 Task.WhenAll(tasks).Wait();
+                downloadedCount += SimultaneousDownloads + 1;
+            }
         }
         catch (Exception e)
         {
@@ -67,20 +60,19 @@ internal static class Program
 
     private static void RunCommand(MissingMusicObj missingTrack)
     {
-        Console.WriteLine("Calling yt-dlp....");
-        var artist = string.IsNullOrEmpty(missingTrack.AlbumArtistNames[0])
-            ? missingTrack.ArtistNames[0]
-            : missingTrack.AlbumArtistNames[0];
-        var search = missingTrack.Name + " " + artist;
+        Console.WriteLine("Calling yt-dlp for track {0}", missingTrack.Name + " " + missingTrack.ArtistNames[0]);
+        var artist = string.IsNullOrEmpty(missingTrack.ArtistNames[0])
+            ? missingTrack.AlbumArtistNames[0]
+            : missingTrack.ArtistNames[0];
+        artist = artist.RemoveChars();
+        var search = missingTrack.Name + " " + artist + " Topic";
         var psi = new ProcessStartInfo
         {
             FileName = "yt-dlp",
             UseShellExecute = true,
             Arguments = "\"ytsearch1:" + search +
                         "\" --preset-alias mp3 --windows-filenames -o \"" + missingTrack.Name +
-                        ".%(ext)s\" -P /home/matthew/Videos/YT/ --parse-metadata \"" + missingTrack.Name +
-                        " :%(title)s\" --parse-metadata \"" + artist +
-                        " :%(artist)s\" --embed-metadata"
+                        ".%(ext)s\" -P /home/matthew/Videos/YT/ --embed-metadata --cookies-from-browser firefox"
         };
         var process = Process.Start(psi);
         process?.WaitForExit();
@@ -91,6 +83,24 @@ internal static class Program
     private static void PostCleanup()
     {
         var webmFiles = Directory.GetFiles("/home/matthew/Videos/YT/", "*.webm");
-        foreach (var file in webmFiles) File.Delete(file);
+        foreach (var file in webmFiles)
+            if (File.Exists(file))
+                File.Delete(file);
+    }
+
+    private static string RemoveChars(this string val)
+    {
+        IDictionary<string, string> badChars = new Dictionary<string, string>
+        {
+            { ",", "" },
+            { "(", "" },
+            { ")", "" },
+            { "{", "" },
+            { "}", "" },
+            { "\"", "" },
+            { "'", "" }
+        };
+
+        return badChars.Aggregate(val, (current, c) => current.Replace(c.Key, c.Value));
     }
 }
