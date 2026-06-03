@@ -5,10 +5,10 @@ namespace JFSI_MissingMusic_Downloader;
 
 internal static class Program
 {
-    private const int SimultaneousDownloads = 50;
-
     private static void Main(string[] args)
     {
+        UpdateDownloader();
+
         foreach (var path in args)
             if (File.Exists(path))
                 ProcessFile(path);
@@ -20,6 +20,19 @@ internal static class Program
         Console.WriteLine("Finished Downloading");
         Console.WriteLine("Init Cleanup");
         PostCleanup();
+    }
+
+    private static void UpdateDownloader()
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = "yt-dlp",
+            UseShellExecute = true,
+            Arguments = "-U"
+        };
+        var process = Process.Start(psi);
+        process?.WaitForExit();
+        process?.Close();
     }
 
     private static void ProcessFilesInFolder(string folderPath)
@@ -38,18 +51,26 @@ internal static class Program
         try
         {
             var fileContents = File.ReadAllText(filePath);
-            var missingTracks = JsonConvert.DeserializeObject<List<MissingMusicObj>>(fileContents);
-            if (missingTracks == null) return;
+            var deserializeObject = JsonConvert.DeserializeObject<List<PlaylistDef>>(fileContents);
+            if (deserializeObject == null) return;
 
-            var downloadedCount = 0;
-            while (downloadedCount < missingTracks.Count)
+            var missingTracks = deserializeObject[0];
+            var songNo = 0;
+            foreach (var track in missingTracks.tracks)
             {
-                var indexToWorkTo = Math.Clamp(downloadedCount + SimultaneousDownloads + 1, 0, missingTracks.Count);
-                var currentIndex = Math.Clamp(downloadedCount, 0, missingTracks.Count);
-                var tasks = missingTracks.GetRange(currentIndex, indexToWorkTo)
-                    .Select(track => Task.Run(() => RunCommand(track))).ToList();
-                Task.WhenAll(tasks).Wait();
-                downloadedCount += SimultaneousDownloads + 1;
+                const string saveLocation = "/run/media/ssd3/JFSI_MissingMusic_Downloader/MissingJsons/tracks/";
+                var title = track.title.RemoveChars();
+                var artist = track.artists[0].RemoveChars();
+
+                if (!File.Exists(saveLocation + title + ".mp3"))
+                    RunCommand(title, artist, saveLocation);
+                else
+                    Console.WriteLine("Song already downloaded skipping. Song: {0}", title + " " + artist);
+
+                songNo += 1;
+                var percent = Math.Round(decimal.Divide(songNo, missingTracks.tracks.Count) * 100, 2);
+                Console.WriteLine("Progress {0}/{1} {2}%", songNo, missingTracks.tracks.Count, percent
+                );
             }
         }
         catch (Exception e)
@@ -58,26 +79,22 @@ internal static class Program
         }
     }
 
-    private static void RunCommand(MissingMusicObj missingTrack)
+    private static void RunCommand(string title, string artist, string saveLocation)
     {
-        Console.WriteLine("Calling yt-dlp for track {0}", missingTrack.Name + " " + missingTrack.ArtistNames[0]);
-        var artist = string.IsNullOrEmpty(missingTrack.ArtistNames[0])
-            ? missingTrack.AlbumArtistNames[0]
-            : missingTrack.ArtistNames[0];
-        artist = artist.RemoveChars();
-        var search = missingTrack.Name + " " + artist + " Topic";
+        var search = title + " " + artist + " Topic";
+        Console.WriteLine("Calling yt-dlp with search {0}", search);
         var psi = new ProcessStartInfo
         {
             FileName = "yt-dlp",
             UseShellExecute = true,
-            Arguments = "\"ytsearch1:" + search +
-                        "\" --preset-alias mp3 --windows-filenames -o \"" + missingTrack.Name +
-                        ".%(ext)s\" -P /home/matthew/Videos/YT/ --embed-metadata --cookies-from-browser firefox"
+            Arguments = "\"ytsearch:" + search +
+                        "\" -t mp3 -t sleep --windows-filenames -o \"" + title + "-" + artist +
+                        ".%(ext)s\" -P " + saveLocation +
+                        " --embed-metadata --cookies-from-browser firefox"
         };
         var process = Process.Start(psi);
         process?.WaitForExit();
         process?.Close();
-        Console.WriteLine("Finished Call");
     }
 
     private static void PostCleanup()
@@ -92,13 +109,21 @@ internal static class Program
     {
         IDictionary<string, string> badChars = new Dictionary<string, string>
         {
+            { ".", "" },
             { ",", "" },
             { "(", "" },
             { ")", "" },
             { "{", "" },
             { "}", "" },
             { "\"", "" },
-            { "'", "" }
+            { "'", "" },
+            { "/", "" },
+            { "\\", "" },
+            { "?", "" },
+            { ";", "" },
+            { "*", "" },
+            { "!", "" },
+            { ":", "" }
         };
 
         return badChars.Aggregate(val, (current, c) => current.Replace(c.Key, c.Value));
