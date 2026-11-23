@@ -3,3 +3,16 @@ obj/
 /packages/
 riderModule.iml
 /_ReSharper.Caches/
+# Secrets and local state (Spotify credentials / login tokens)
+.env
+.cache
+spotify_lib/.env
+spotify_lib/.cache
+*.log
+
+# IDE / user settings
+.idea/
+*.DotSettings.user
+
+# Downloaded music, playlists, trims and exported Spotify data
+MissingJsons/
