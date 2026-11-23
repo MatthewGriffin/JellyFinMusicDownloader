@@ -743,6 +743,8 @@ def export_liked_songs(sp: spotipy.Spotify, split: bool, output_dir: Path,
         'playlist_id': 'liked_songs',  # Special identifier
         'owner_id': user_id,
         'owner': user_name,
+        'current_user_id': user_id,
+        'collaborative': False,
         'description': 'Your liked songs from Spotify',
         'snapshot_id': '',
         'tracks': tracks
@@ -795,6 +797,13 @@ def export_playlists(sp: spotipy.Spotify, split: bool, output_dir: Path,
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Output directory set to: {output_dir}")
 
+    # Who is logged in? Exported with each playlist so the downloader can skip playlists owned by someone else.
+    try:
+        current_user_id = sp.current_user().get('id')
+    except Exception as e:
+        logger.warning(f"Could not retrieve current user id: {e}")
+        current_user_id = None
+
     # Normalize filter if provided
     normalized_filter = normalize_playlist_name(playlist_name_filter) if playlist_name_filter else None
     if normalized_filter:
@@ -832,6 +841,8 @@ def export_playlists(sp: spotipy.Spotify, split: bool, output_dir: Path,
             'playlist_id': playlist['id'],
             'owner_id': owner_id,
             'owner': owner_name,
+            'current_user_id': current_user_id,
+            'collaborative': bool(playlist.get('collaborative', False)),
             'description': playlist.get('description', ''),
             'snapshot_id': playlist.get('snapshot_id', ''),
             'tracks': tracks

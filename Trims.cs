@@ -9,6 +9,8 @@ internal record TrimEntry(string VideoId, double Start, double End, bool Skip);
 
 internal record PendingTrim(TrackObj Track, Candidate Candidate);
 
+internal enum Step { Done, Skipped, Eof }
+
 /// <summary>
 ///     Tracks that only exist on YouTube as a longer video (music video with intro/outro, etc.).
 ///     Nothing is ever trimmed on a guess: they are collected during the run, then you are asked for the
@@ -29,7 +31,7 @@ internal static class Trims
         lock (Gate) return _entries.GetValueOrDefault(key);
     }
 
-    private static void Set(string key, TrimEntry entry)
+    internal static void Set(string key, TrimEntry entry)
     {
         lock (Gate)
         {
@@ -74,9 +76,6 @@ internal static class Trims
     /// <returns>false if input ended and we should stop asking.</returns>
     private static bool Ask(PendingTrim p, int n, int total)
     {
-        var key = Program.TrackKey(p.Track);
-        var title = p.Track.name.RemoveChars();
-        var artist = p.Track.artist.RemoveChars();
         var spotify = (p.Track.duration_ms ?? 0) / 1000.0;
         var video = p.Candidate.Duration ?? 0;
 
@@ -86,18 +85,34 @@ internal static class Trims
         Console.WriteLine("  Found video    : {0} | {1} ({2})", p.Candidate.Channel, p.Candidate.Title, Fmt(video));
         Console.WriteLine("  Link           : https://www.youtube.com/watch?v={0}", p.Candidate.Id);
 
+        return PromptTrim(p.Track, p.Candidate.Id, video, true) != Step.Eof;
+    }
+
+    /// <summary>
+    ///     Asks for start/end times, confirms, downloads the trimmed range and remembers it.
+    ///     allowNever: offer "x" (never ask about this track again). Otherwise Enter just goes back to the caller.
+    /// </summary>
+    internal static Step PromptTrim(TrackObj track, string videoId, double video, bool allowNever)
+    {
+        var key = Program.TrackKey(track);
+        var title = track.name.RemoveChars();
+        var artist = track.artist.RemoveChars();
+        var spotify = (track.duration_ms ?? 0) / 1000.0;
+
         while (true)
         {
-            Console.Write("  Start time (Enter = skip for now, x = never ask again): ");
+            Console.Write(allowNever
+                ? "  Start time (Enter = skip for now, x = never ask again): "
+                : "  Start time (Enter = back to the list): ");
             var s = Console.ReadLine();
-            if (s == null) return false;
+            if (s == null) return Step.Eof;
             s = s.Trim();
-            if (s.Length == 0) return true;
-            if (s.Equals("x", StringComparison.OrdinalIgnoreCase))
+            if (s.Length == 0) return Step.Skipped;
+            if (allowNever && s.Equals("x", StringComparison.OrdinalIgnoreCase))
             {
-                Set(key, new TrimEntry(p.Candidate.Id, 0, 0, true));
+                Set(key, new TrimEntry(videoId, 0, 0, true));
                 Console.WriteLine("  OK, won't ask about this track again (edit trims.json to undo).");
-                return true;
+                return Step.Done;
             }
 
             var start = ParseTime(s);
@@ -110,7 +125,7 @@ internal static class Trims
             var suggested = Math.Min(start.Value + spotify, video);
             Console.Write("  End time [Enter = {0}, start + Spotify's length]: ", Fmt(suggested));
             var e = Console.ReadLine();
-            if (e == null) return false;
+            if (e == null) return Step.Eof;
             e = e.Trim();
             var end = e.Length == 0 ? suggested : ParseTime(e);
             if (end == null || end <= start || end > video + 1)
@@ -127,22 +142,22 @@ internal static class Trims
 
             Console.Write("  Download this range? [y/N]: ");
             var ok = Console.ReadLine();
-            if (ok == null) return false;
+            if (ok == null) return Step.Eof;
             if (!ok.Trim().StartsWith("y", StringComparison.OrdinalIgnoreCase))
             {
-                Console.WriteLine("  Not downloaded. Enter new times, or press Enter at the start prompt to skip.");
+                Console.WriteLine("  Not downloaded. Enter new times, or press Enter at the start prompt to go back.");
                 continue;
             }
 
             Console.WriteLine("  Downloading and trimming...");
-            if (Program.DownloadAudio(p.Track, p.Candidate.Id, title, artist, start, end))
+            if (Program.DownloadAudio(track, videoId, title, artist, start, end))
             {
-                Set(key, new TrimEntry(p.Candidate.Id, start.Value, end.Value, false));
+                Set(key, new TrimEntry(videoId, start.Value, end.Value, false));
                 Console.WriteLine("  Saved. These timings are remembered in trims.json.");
-                return true;
+                return Step.Done;
             }
 
-            Console.WriteLine("  Download failed. Try again, or press Enter at the start prompt to skip.");
+            Console.WriteLine("  Download failed. Try again, or press Enter at the start prompt to go back.");
         }
     }
 

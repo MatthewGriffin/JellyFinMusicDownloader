@@ -4,6 +4,10 @@ public class PlaylistDef
 {
     public required string playlist_id { get; set; }
     public required string playlist_name { get; set; }
+    public string? owner_id { get; set; }
+    public string? owner { get; set; }
+    public string? current_user_id { get; set; }   // the Spotify account that was logged in when exported
+    public bool collaborative { get; set; }
     public required List<TrackObj> tracks { get; set; }
 }
 

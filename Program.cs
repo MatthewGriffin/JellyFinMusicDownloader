@@ -11,6 +11,7 @@ internal static class Program
     private const int MaxParallelDownloads = 4; // lower this if YouTube starts rate-limiting
     private static readonly object LogLock = new();
     private static readonly List<PlaylistDef> AllPlaylists = [];
+    private static bool _includeFollowed;
     private const string UnmatchedLogName = "unmatched.log";
     // Tracks we already failed to match: skipped automatically (run with --retry-unmatched to try them again).
     private static readonly HashSet<string> Unmatched = LoadUnmatched();
@@ -18,6 +19,8 @@ internal static class Program
 
     private static void Main(string[] args)
     {
+        _includeFollowed = args.Contains("--include-followed");
+
         if (args.Contains("--retry-unmatched"))
         {
             // Forget the old failures; anything that still can't be matched is written back as it is found.
@@ -47,6 +50,7 @@ internal static class Program
                 var deserializeObject = JsonConvert.DeserializeObject<List<PlaylistDef>>(fileContents);
                 if (deserializeObject == null || deserializeObject.Count == 0) continue;
                 var playlist = deserializeObject[0];
+                if (SkipPlaylist(playlist)) continue;
                 ProcessFile(playlist);
                 AllPlaylists.Add(playlist);
                 Generate3MUPlaylist(playlist); // partial copy in case the run is interrupted
@@ -63,11 +67,45 @@ internal static class Program
         UI.Stop();
         UI.WriteLine("Finished Downloading");
         Trims.ResolvePending(); // asks you for start/end times for tracks that only exist as a longer video
+        Picker.ResolveAll();    // lets you choose a video yourself for tracks with no confident match
 
         // Final pass: now that trims are resolved, rewrite every playlist from what is really on disk.
         foreach (var playlist in AllPlaylists) Generate3MUPlaylist(playlist);
         UI.WriteLine("Init Cleanup");
         PostCleanup();
+
+        // Exit code 0 only when every track of every processed playlist is on disk and verified (usable from scripts).
+        Environment.ExitCode = Report.Print(AllPlaylists, SaveLocation) ? 0 : 1;
+    }
+
+    /// <summary>
+    ///     True for playlists you only follow (owned by another Spotify user and not collaborative): they are not
+    ///     downloaded unless --include-followed is given. If the owner or your id is unknown we don't skip.
+    /// </summary>
+    private static bool IsFollowedPlaylist(PlaylistDef p) =>
+        !_includeFollowed
+        && !string.IsNullOrEmpty(p.current_user_id)
+        && !string.IsNullOrEmpty(p.owner_id)
+        && p.owner_id != p.current_user_id
+        && !p.collaborative;
+
+    /// <returns>Why this playlist is skipped, or null if it should be downloaded.</returns>
+    private static string? SkipReason(PlaylistDef p)
+    {
+        if (Blocklist.IsBlocked(p.playlist_name))
+            return "it is on your blocklist (MissingJsons/playlist_blocklist.txt)";
+        if (IsFollowedPlaylist(p))
+            return $"owned by {p.owner ?? p.owner_id}, not you (use --include-followed to download it anyway)";
+        return null;
+    }
+
+    private static bool SkipPlaylist(PlaylistDef playlist)
+    {
+        var reason = SkipReason(playlist);
+        if (reason == null) return false;
+        UI.WriteLine("Skipping playlist '{0}' ({1} tracks): {2}", playlist.playlist_name, playlist.tracks.Count, reason);
+        Report.SkippedPlaylist(playlist.playlist_name, playlist.tracks.Count, reason);
+        return true;
     }
 
     internal static string TrackKey(TrackObj t) => t.name.RemoveChars() + "-" + t.artist.RemoveChars();
@@ -80,7 +118,7 @@ internal static class Program
             return files.Sum(f =>
             {
                 var list = JsonConvert.DeserializeObject<List<PlaylistDef>>(File.ReadAllText(f));
-                return list is { Count: > 0 } ? list[0].tracks.DistinctBy(TrackKey).Count() : 0;
+                return list is { Count: > 0 } && SkipReason(list[0]) == null ? list[0].tracks.DistinctBy(TrackKey).Count() : 0;
             });
         }
         catch { return 0; }
@@ -111,6 +149,7 @@ internal static class Program
             var deserializeObject = JsonConvert.DeserializeObject<List<PlaylistDef>>(fileContents);
             if (deserializeObject == null || deserializeObject.Count == 0) continue;
             var playlist = deserializeObject[0];
+            if (SkipPlaylist(playlist)) continue;
             ProcessFile(playlist);
             AllPlaylists.Add(playlist);
             Generate3MUPlaylist(playlist); // partial copy in case the run is interrupted
@@ -158,7 +197,7 @@ internal static class Program
     }
 
     // Playlist names come from Spotify and can contain characters that are invalid or dangerous in a file name ("AC/DC").
-    private static string SafeFileName(string name)
+    internal static string SafeFileName(string name)
     {
         var cleaned = string.Concat(name.Select(c => Path.GetInvalidFileNameChars().Contains(c) || c is ':' or '*' or '?' or '"' or '<' or '>' or '|' ? '_' : c)).Trim().TrimEnd('.');
         return cleaned.Length == 0 ? "playlist" : cleaned;
@@ -189,8 +228,10 @@ internal static class Program
                 catch (Exception e)
                 {
                     UI.WriteLine("!!!! Failed {0} - {1}: {2}", track.name, track.artist, e.Message);
+                    Report.Note(TrackKey(track), "error: " + e.Message);
                 }
 
+                Report.SetOutcome(TrackKey(track), outcome);
                 UI.TrackEnd(outcome);
             });
         }
@@ -209,14 +250,31 @@ internal static class Program
         var saved = Trims.Get(key);
         if (saved != null)
         {
-            if (saved.Skip) return Outcome.NoMatch;
+            if (saved.Skip)
+            {
+                Report.Note(key, "you chose \"never ask again\" for this track (trims.json)");
+                return Outcome.NoMatch;
+            }
+
             UI.WriteLine("Using your saved trim for {0} - {1}", track.name, track.artist);
-            return DownloadAudio(track, saved.VideoId, title, artist, saved.Start, saved.End) ? Outcome.Downloaded : Outcome.Failed;
+            // End > Start = a trim you confirmed; otherwise it's a whole video you picked yourself.
+            var ok = saved.End > saved.Start
+                ? DownloadAudio(track, saved.VideoId, title, artist, saved.Start, saved.End)
+                : DownloadAudio(track, saved.VideoId, title, artist, userChosen: true);
+            if (!ok) Report.Note(key, "download of your saved choice failed (trims.json)");
+            return ok ? Outcome.Downloaded : Outcome.Failed;
         }
 
         if (Trims.Pending.ContainsKey(key)) return Outcome.NeedsTrim; // same song in another playlist
 
-        if (IsUnmatched(track)) return Outcome.NoMatch; // failed before, don't waste searches on it
+        if (IsUnmatched(track))
+        {
+            // failed before, don't waste searches on it
+            Report.Note(key, RejectedEarlier.TryGetValue(UnmatchedKey(track), out var why)
+                ? "rejected after download on an earlier run: " + why + " (--retry-unmatched tries again)"
+                : "no confident match on an earlier run (in unmatched.log; --retry-unmatched tries again)");
+            return Outcome.NoMatch;
+        }
 
         UI.WriteLine("Searching for {0} - {1}", track.name, track.artist);
         var match = TrackMatcher.FindMatch(track);
@@ -224,6 +282,7 @@ internal static class Program
         if (match.Best == null && match.TrimCandidate != null)
         {
             Trims.Pending[key] = new PendingTrim(track, match.TrimCandidate);
+            Report.Note(key, "only a longer video exists; you skipped (or have not answered) the trim prompt");
             UI.WriteLine("Needs trimming (only a longer video exists), will ask at the end: {0} - {1}", track.name, track.artist);
             return Outcome.NeedsTrim;
         }
@@ -231,16 +290,45 @@ internal static class Program
         if (match.Best == null)
         {
             UI.WriteLine("!!! No confident match, skipping: {0} - {1}", track.name, track.artist);
+            // Keep what the search saw so you can pick one yourself after the run.
+            Picker.Pending[key] = new PendingPick(track, match.Candidates.ToList());
+            Report.Note(key, "no confident match found; you skipped (or have not answered) the picker");
             RecordUnmatched(track);
             return Outcome.NoMatch;
         }
 
         var best = match.Best;
         UI.WriteLine("Chosen: {0} | {1} (score {2:F1})", best.Channel, best.Title, best.Score);
-        return DownloadAudio(track, best.Id, title, artist) ? Outcome.Downloaded : Outcome.Failed;
+        var downloaded = DownloadAudio(track, best.Id, title, artist);
+        if (!downloaded) Report.Note(key, "download failed: yt-dlp produced no file");
+        return downloaded ? Outcome.Downloaded : Outcome.Failed;
     }
 
     private static string UnmatchedKey(TrackObj t) => t.name + " - " + t.artist;
+
+    // rejected.log lines look like: "<name> - <artist> | <reason> | <youtube title> | <url>"; the last one per track wins.
+    private static readonly Dictionary<string, string> RejectedEarlier = LoadRejected();
+
+    private static Dictionary<string, string> LoadRejected()
+    {
+        var d = new Dictionary<string, string>();
+        try
+        {
+            var path = SaveLocation + "rejected.log";
+            if (!File.Exists(path)) return d;
+            foreach (var l in File.ReadAllLines(path))
+            {
+                var parts = l.Split(" | ");
+                if (parts.Length >= 2) d[parts[0].Trim()] = parts[1].Trim();
+            }
+        }
+        catch
+        {
+            // best effort: only affects the wording of the report
+        }
+
+        return d;
+    }
 
     private static HashSet<string> LoadUnmatched()
     {
@@ -274,7 +362,7 @@ internal static class Program
     ///     Spotify track. A file that fails verification is deleted and logged to rejected.log.
     /// </summary>
     internal static bool DownloadAudio(TrackObj track, string videoId, string title, string artist,
-        double? start = null, double? end = null)
+        double? start = null, double? end = null, bool userChosen = false)
     {
         var trimmed = start.HasValue && end.HasValue;
         var section = trimmed
@@ -290,6 +378,9 @@ internal static class Program
         var path = SaveLocation + title + "-" + artist + ".mp3";
         if (!File.Exists(path)) return false;
 
+        // You chose this video yourself: don't second-guess it. (A trim still has its length checked.)
+        if (userChosen && !trimmed) return true;
+
         // Trims were chosen by you, so only check the length came out as selected. Everything else gets the full check.
         var result = trimmed
             ? Verifier.Check(path, track, end!.Value - start!.Value, 3, false)
@@ -297,6 +388,7 @@ internal static class Program
         if (result.Ok) return true;
 
         File.Delete(path);
+        Report.Note(TrackKey(track), "rejected after download: " + result.Reason);
         UI.WriteLine("!!! Rejected after download, file deleted: {0} - {1}: {2}", track.name, track.artist, result.Reason);
         lock (LogLock)
             File.AppendAllText(SaveLocation + "rejected.log",

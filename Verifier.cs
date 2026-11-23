@@ -34,7 +34,7 @@ internal static class Verifier
         return new Result(true, "", title, url);
     }
 
-    private static (double Duration, string Title, string Url)? Probe(string path)
+    internal static (double Duration, string Title, string Url)? Probe(string path)
     {
         try
         {
