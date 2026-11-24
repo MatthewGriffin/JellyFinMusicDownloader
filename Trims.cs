@@ -22,9 +22,9 @@ internal static class Trims
     private const double LengthWarnSeconds = 3; // warn if your range differs from Spotify's length by more than this
 
     private static readonly object Gate = new();
-    private static Dictionary<string, TrimEntry> _entries = Load();
+    private static Dictionary<string, TrimEntry> _entries = Load();   // keys compared ignoring case
 
-    public static readonly ConcurrentDictionary<string, PendingTrim> Pending = new();
+    public static readonly ConcurrentDictionary<string, PendingTrim> Pending = new(StringComparer.OrdinalIgnoreCase);
 
     public static TrimEntry? Get(string key)
     {
@@ -42,16 +42,19 @@ internal static class Trims
 
     private static Dictionary<string, TrimEntry> Load()
     {
+        var d = new Dictionary<string, TrimEntry>(StringComparer.OrdinalIgnoreCase);
         try
         {
-            return File.Exists(StorePath)
-                ? JsonConvert.DeserializeObject<Dictionary<string, TrimEntry>>(File.ReadAllText(StorePath)) ?? new()
-                : new();
+            if (File.Exists(StorePath))
+                foreach (var kv in JsonConvert.DeserializeObject<Dictionary<string, TrimEntry>>(File.ReadAllText(StorePath)) ?? new())
+                    d[kv.Key] = kv.Value;
         }
         catch
         {
-            return new();
+            // unreadable store: start empty rather than stop the run
         }
+
+        return d;
     }
 
     // ---- interactive part (runs after the progress bar has stopped) ----
@@ -95,8 +98,6 @@ internal static class Trims
     internal static Step PromptTrim(TrackObj track, string videoId, double video, bool allowNever)
     {
         var key = Program.TrackKey(track);
-        var title = track.name.RemoveChars();
-        var artist = track.artist.RemoveChars();
         var spotify = (track.duration_ms ?? 0) / 1000.0;
 
         while (true)
@@ -150,7 +151,7 @@ internal static class Trims
             }
 
             Console.WriteLine("  Downloading and trimming...");
-            if (Program.DownloadAudio(track, videoId, title, artist, start, end))
+            if (Program.DownloadAudio(track, videoId, start, end))
             {
                 Set(key, new TrimEntry(videoId, start.Value, end.Value, false));
                 Console.WriteLine("  Saved. These timings are remembered in trims.json.");

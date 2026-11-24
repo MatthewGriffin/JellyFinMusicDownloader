@@ -12,6 +12,9 @@ internal static class Program
     private static readonly object LogLock = new();
     private static readonly List<PlaylistDef> AllPlaylists = [];
     private static bool _includeFollowed;
+    private static bool _skipTagging;
+    private static bool _keepOrphans;
+    private static bool _forceOrphans;
     private const string UnmatchedLogName = "unmatched.log";
     // Tracks we already failed to match: skipped automatically (run with --retry-unmatched to try them again).
     private static readonly HashSet<string> Unmatched = LoadUnmatched();
@@ -20,6 +23,9 @@ internal static class Program
     private static void Main(string[] args)
     {
         _includeFollowed = args.Contains("--include-followed");
+        _keepOrphans = args.Contains("--keep-orphans");   // don't move songs that are in none of your playlists
+        _forceOrphans = args.Contains("--force-orphans"); // move them even if that is an unusually large share of the library
+        _skipTagging = args.Contains("--no-tag"); // leave files with YouTube's tags and no cover art
 
         if (args.Contains("--retry-unmatched"))
         {
@@ -40,6 +46,12 @@ internal static class Program
 
         UpdateDownloader();
         GetPlaylistsJSON();
+
+        Library.Init(SaveLocation);
+        var merged = Library.MergeDuplicates(LoadAllTracks());
+        if (merged.Count > 0)
+            UI.WriteLine("Merged {0} duplicate file(s): same YouTube video and byte-identical, so each now has ONE copy " +
+                         "(the extra copies are in MissingJsons/merged_duplicates/)", merged.Count);
 
         var jsons = Directory.GetFiles(JsonLocation);
         UI.Start(jsons.Sum(CountTracks));
@@ -68,6 +80,8 @@ internal static class Program
         UI.WriteLine("Finished Downloading");
         Trims.ResolvePending(); // asks you for start/end times for tracks that only exist as a longer video
         Picker.ResolveAll();    // lets you choose a video yourself for tracks with no confident match
+        if (!_skipTagging) Tagger.TagAll(SaveLocation, AllPlaylists); // Spotify tags + cover art for every file not done yet
+        if (!_keepOrphans) Orphans.MoveAll(SaveLocation, AllPlaylists, _forceOrphans); // dedicated step: songs in no playlist leave the library
 
         // Final pass: now that trims are resolved, rewrite every playlist from what is really on disk.
         foreach (var playlist in AllPlaylists) Generate3MUPlaylist(playlist);
@@ -108,6 +122,25 @@ internal static class Program
         return true;
     }
 
+    private static List<TrackObj> LoadAllTracks()
+    {
+        var all = new List<TrackObj>();
+        try
+        {
+            foreach (var f in Directory.GetFiles(JsonLocation, "*.json"))
+            {
+                var list = JsonConvert.DeserializeObject<List<PlaylistDef>>(File.ReadAllText(f));
+                if (list is { Count: > 0 } && SkipReason(list[0]) == null) all.AddRange(list[0].tracks);
+            }
+        }
+        catch
+        {
+            // best effort: only used to decide which copy of a duplicate to keep
+        }
+
+        return all;
+    }
+
     internal static string TrackKey(TrackObj t) => t.name.RemoveChars() + "-" + t.artist.RemoveChars();
 
     private static int CountTracks(string path)
@@ -118,7 +151,7 @@ internal static class Program
             return files.Sum(f =>
             {
                 var list = JsonConvert.DeserializeObject<List<PlaylistDef>>(File.ReadAllText(f));
-                return list is { Count: > 0 } && SkipReason(list[0]) == null ? list[0].tracks.DistinctBy(TrackKey).Count() : 0;
+                return list is { Count: > 0 } && SkipReason(list[0]) == null ? list[0].tracks.DistinctBy(TrackKey, StringComparer.OrdinalIgnoreCase).Count() : 0;
             });
         }
         catch { return 0; }
@@ -171,7 +204,7 @@ internal static class Program
 
             foreach (var track in playlist.tracks)
             {
-                var file = track.name.RemoveChars() + "-" + track.artist.RemoveChars() + ".mp3";
+                var file = Library.FileNameFor(track);
                 if (!File.Exists(SaveLocation + file))
                 {
                     missing++;
@@ -209,7 +242,7 @@ internal static class Program
         {
             UI.SetPlaylist(playlist.playlist_name);
             // Same song can appear twice in a playlist; only fetch it once.
-            var unique = playlist.tracks.DistinctBy(TrackKey);
+            var unique = playlist.tracks.DistinctBy(TrackKey, StringComparer.OrdinalIgnoreCase);
 
             Parallel.ForEach(unique, new ParallelOptions { MaxDegreeOfParallelism = MaxParallelDownloads }, track =>
             {
@@ -217,13 +250,10 @@ internal static class Program
                 var outcome = Outcome.Failed;
                 try
                 {
-                    var title = track.name.RemoveChars();
-                    var artist = track.artist.RemoveChars();
-
-                    if (File.Exists(SaveLocation + title + "-" + artist + ".mp3"))
+                    if (Library.Exists(track) || Orphans.TryRestore(SaveLocation, track))
                         outcome = Outcome.AlreadyHad;
                     else
-                        outcome = RunDownloadCommand(track, title, artist, SaveLocation);
+                        outcome = RunDownloadCommand(track);
                 }
                 catch (Exception e)
                 {
@@ -242,7 +272,7 @@ internal static class Program
         }
     }
 
-    private static Outcome RunDownloadCommand(TrackObj track, string title, string artist, string saveLocation)
+    private static Outcome RunDownloadCommand(TrackObj track)
     {
         var key = TrackKey(track);
 
@@ -259,8 +289,8 @@ internal static class Program
             UI.WriteLine("Using your saved trim for {0} - {1}", track.name, track.artist);
             // End > Start = a trim you confirmed; otherwise it's a whole video you picked yourself.
             var ok = saved.End > saved.Start
-                ? DownloadAudio(track, saved.VideoId, title, artist, saved.Start, saved.End)
-                : DownloadAudio(track, saved.VideoId, title, artist, userChosen: true);
+                ? DownloadAudio(track, saved.VideoId, saved.Start, saved.End)
+                : DownloadAudio(track, saved.VideoId, userChosen: true);
             if (!ok) Report.Note(key, "download of your saved choice failed (trims.json)");
             return ok ? Outcome.Downloaded : Outcome.Failed;
         }
@@ -299,7 +329,7 @@ internal static class Program
 
         var best = match.Best;
         UI.WriteLine("Chosen: {0} | {1} (score {2:F1})", best.Channel, best.Title, best.Score);
-        var downloaded = DownloadAudio(track, best.Id, title, artist);
+        var downloaded = DownloadAudio(track, best.Id);
         if (!downloaded) Report.Note(key, "download failed: yt-dlp produced no file");
         return downloaded ? Outcome.Downloaded : Outcome.Failed;
     }
@@ -311,7 +341,7 @@ internal static class Program
 
     private static Dictionary<string, string> LoadRejected()
     {
-        var d = new Dictionary<string, string>();
+        var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         try
         {
             var path = SaveLocation + "rejected.log";
@@ -336,12 +366,12 @@ internal static class Program
         {
             var path = SaveLocation + UnmatchedLogName;
             return File.Exists(path)
-                ? File.ReadAllLines(path).Select(l => l.Trim()).Where(l => l.Length > 0).ToHashSet()
-                : [];
+                ? File.ReadAllLines(path).Select(l => l.Trim()).Where(l => l.Length > 0).ToHashSet(StringComparer.OrdinalIgnoreCase)
+                : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         }
         catch
         {
-            return [];
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         }
     }
 
@@ -361,31 +391,55 @@ internal static class Program
     ///     Downloads a video's audio as mp3 (optionally only start..end seconds) and verifies the result against the
     ///     Spotify track. A file that fails verification is deleted and logged to rejected.log.
     /// </summary>
-    internal static bool DownloadAudio(TrackObj track, string videoId, string title, string artist,
-        double? start = null, double? end = null, bool userChosen = false)
+    internal static bool DownloadAudio(TrackObj track, string videoId, double? start = null, double? end = null,
+        bool userChosen = false)
     {
         var trimmed = start.HasValue && end.HasValue;
+        var videoKey = Library.VideoKey(videoId, start, end);
+
+        // This exact video (or trimmed range) is already in the library for another Spotify entry: share that file
+        // instead of downloading a second identical copy. Both playlist lines will point at it.
+        var shared = Library.FileForVideo(videoKey);
+        if (shared != null)
+        {
+            Library.Alias(track, shared);
+            UI.WriteLine("Sharing '{0}' with {1} - {2}: same YouTube video, so no second copy", shared, track.name, track.artist);
+            return true;
+        }
+
+        var fileName = Library.DefaultFileName(track);
+        var stem = fileName[..^4];
         var section = trimmed
             ? string.Format(CultureInfo.InvariantCulture,
                 " --download-sections \"*{0:0.###}-{1:0.###}\" --force-keyframes-at-cuts", start, end)
             : "";
         RunCommand("yt-dlp", false, true, "\"https://www.youtube.com/watch?v=" + videoId +
                                          "\" -t mp3 -q --sleep-interval 1 --max-sleep-interval 3 --windows-filenames -o \"" +
-                                         title + "-" + artist + ".%(ext)s\" -P " + SaveLocation +
+                                         stem + ".%(ext)s\" -P " + SaveLocation +
                                          " --embed-metadata --cookies-from-browser firefox" +
                                          " --js-runtimes node --remote-components ejs:github" + section);
 
-        var path = SaveLocation + title + "-" + artist + ".mp3";
+        var path = SaveLocation + fileName;
         if (!File.Exists(path)) return false;
 
         // You chose this video yourself: don't second-guess it. (A trim still has its length checked.)
-        if (userChosen && !trimmed) return true;
+        if (userChosen && !trimmed)
+        {
+            Library.Register(fileName, videoKey);
+            if (!_skipTagging) Tagger.Apply(SaveLocation, fileName, track);
+            return true;
+        }
 
         // Trims were chosen by you, so only check the length came out as selected. Everything else gets the full check.
         var result = trimmed
             ? Verifier.Check(path, track, end!.Value - start!.Value, 3, false)
             : Verifier.Check(path, track, (track.duration_ms ?? 0) / 1000.0, 8, true);
-        if (result.Ok) return true;
+        if (result.Ok)
+        {
+            Library.Register(fileName, videoKey);
+            if (!_skipTagging) Tagger.Apply(SaveLocation, fileName, track);
+            return true;
+        }
 
         File.Delete(path);
         Report.Note(TrackKey(track), "rejected after download: " + result.Reason);

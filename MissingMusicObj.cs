@@ -19,4 +19,9 @@ public class TrackObj
     public required string artist { get; init; }
     public long? duration_ms { get; init; }
     public string? isrc { get; init; }
+    public string? album_release_date { get; init; }
+    public string? album_image_url { get; init; }   // Spotify cover art (640x640)
+    public string? album_artist { get; init; }
+    public int? track_number { get; init; }
+    public int? disc_number { get; init; }
 }

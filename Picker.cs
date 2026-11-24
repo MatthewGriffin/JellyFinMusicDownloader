@@ -13,7 +13,7 @@ internal record PendingPick(TrackObj Track, List<Candidate> Candidates);
 /// </summary>
 internal static class Picker
 {
-    public static readonly ConcurrentDictionary<string, PendingPick> Pending = new();
+    public static readonly ConcurrentDictionary<string, PendingPick> Pending = new(StringComparer.OrdinalIgnoreCase);
 
     private const int ShowMax = 8;
     private const double SameLengthSeconds = 6; // same tolerance the matcher uses
@@ -132,7 +132,7 @@ internal static class Picker
         if (!ok.Trim().StartsWith("y", StringComparison.OrdinalIgnoreCase)) return Step.Skipped;
 
         Console.WriteLine("  Downloading...");
-        if (Program.DownloadAudio(track, id, track.name.RemoveChars(), track.artist.RemoveChars(), userChosen: true))
+        if (Program.DownloadAudio(track, id, userChosen: true))
         {
             Trims.Set(Program.TrackKey(track), new TrimEntry(id, 0, 0, false));
             Console.WriteLine("  Saved. This choice is remembered in trims.json.");

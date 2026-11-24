@@ -240,6 +240,11 @@ def _process_tracks_data(sp: spotipy.Spotify, tracks_data, logger, source_descri
                     'artist': artist_names,
                     'album': album_name,
                     'album_release_date': album_release_date,
+                    # cover art (the first image Spotify lists is the largest, 640x640) and album-level credits
+                    'album_image_url': ((album.get('images') or [{}])[0].get('url') or ''),
+                    'album_artist': ', '.join(a.get('name', '') for a in (album.get('artists') or []) if a.get('name')),
+                    'track_number': track.get('track_number'),
+                    'disc_number': track.get('disc_number'),
                     'duration_ms': track.get('duration_ms'),
                     'isrc': (track.get('external_ids') or {}).get('isrc'),
                     'spotify_url': spotify_url,

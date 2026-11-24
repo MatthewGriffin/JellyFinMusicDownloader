@@ -10,8 +10,8 @@ namespace JFSI_MissingMusic_Downloader;
 /// </summary>
 internal static class Report
 {
-    private static readonly ConcurrentDictionary<string, string> Reasons = new();
-    private static readonly ConcurrentDictionary<string, Outcome> Outcomes = new();
+    private static readonly ConcurrentDictionary<string, string> Reasons = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly ConcurrentDictionary<string, Outcome> Outcomes = new(StringComparer.OrdinalIgnoreCase);
     private static readonly List<(string Name, int Tracks, string Reason)> Skipped = [];
     private static readonly object Gate = new();
 
@@ -36,9 +36,9 @@ internal static class Report
     /// <returns>true only if the verdict is COMPLETE or COMPLETE WITH WARNINGS (nothing missing, nothing broken).</returns>
     public static bool Print(IReadOnlyList<PlaylistDef> playlists, string saveLocation)
     {
-        string FileOf(TrackObj t) => t.name.RemoveChars() + "-" + t.artist.RemoveChars() + ".mp3";
+        string FileOf(TrackObj t) => Library.FileNameFor(t);
         bool Exists(TrackObj t) => File.Exists(saveLocation + FileOf(t));
-        var unique = playlists.SelectMany(p => p.tracks).DistinctBy(Program.TrackKey).ToList();
+        var unique = playlists.SelectMany(p => p.tracks).DistinctBy(Program.TrackKey, StringComparer.OrdinalIgnoreCase).ToList();
         var present = unique.Where(Exists).ToList();
         var stillMissing = unique.Where(t => !Exists(t)).ToList();
 
@@ -99,7 +99,7 @@ internal static class Report
         }
 
         // mp3s that belong to no processed playlist (informational only, never touched)
-        var expectedFiles = unique.Select(FileOf).ToHashSet();
+        var expectedFiles = unique.Select(FileOf).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var orphans = Directory.Exists(saveLocation)
             ? Directory.GetFiles(saveLocation, "*.mp3").Select(Path.GetFileName).Where(f => !expectedFiles.Contains(f!)).OrderBy(f => f).ToList()
             : [];
@@ -166,7 +166,7 @@ internal static class Report
         Both("Per playlist:");
         foreach (var p in playlists)
         {
-            var tracks = p.tracks.DistinctBy(Program.TrackKey).ToList();
+            var tracks = p.tracks.DistinctBy(Program.TrackKey, StringComparer.OrdinalIgnoreCase).ToList();
             var missing = tracks.Where(t => !Exists(t)).ToList();
             if (missing.Count == 0)
             {
@@ -193,9 +193,17 @@ internal static class Report
             List(titleOff, "      - ");
         }
 
+        var taggedCount = Library.TaggedCount(present.Select(FileOf));
+        Both($"  Spotify tags + cover art  : {taggedCount} of {present.Count} files" + (taggedCount < present.Count ? "  (the rest are tagged on the next run, or run without --no-tag)" : ""));
         Both($"  playlist (.m3u) files     : {(playlistFileProblems.Count == 0 ? $"all {playlists.Count} present and consistent" : playlistFileProblems.Count + " problem(s)")}");
         List(playlistFileProblems, "      - ");
-        Both($"  mp3s in no processed playlist: {orphans.Count}  (informational, never touched)");
+        Both($"  one file shared by several Spotify entries: {Library.SharedEntries}  (same YouTube video, so one copy; each entry keeps its own playlist line)");
+        if (Library.MergedThisRun > 0)
+            Both($"  duplicate copies merged this run: {Library.MergedThisRun}  (extra copies are in MissingJsons/merged_duplicates/)");
+        if (Orphans.MovedThisRun > 0)
+            Both($"  orphaned songs moved this run: {Orphans.MovedThisRun}  (to MissingJsons/orphaned/, listed in ORPHANED.txt; they come back automatically if a playlist wants them again)");
+        if (Orphans.Refused != null) Both("  ORPHAN STEP SKIPPED: " + Orphans.Refused);
+        Both($"  mp3s still in no processed playlist: {orphans.Count}");
         List(orphans.Select(o => o!).ToList(), "      - ");
 
         Both("");

@@ -47,7 +47,7 @@ internal static class Verifier
             };
             foreach (var a in new[]
                      {
-                         "-v", "error", "-show_entries", "format=duration:format_tags=title,purl", "-of", "json", path
+                         "-v", "error", "-show_entries", "format=duration:format_tags=title,purl,yt_title", "-of", "json", path
                      })
                 psi.ArgumentList.Add(a);
 
@@ -61,7 +61,8 @@ internal static class Verifier
             if (format == null) return null;
             var duration = (double?)format["duration"] ?? 0;
             var tags = format["tags"];
-            return (duration, (string?)tags?["title"] ?? "", (string?)tags?["purl"] ?? "");
+            // After tagging, "title" is Spotify's; the original YouTube title is kept in "yt_title" so later checks still work.
+            return (duration, (string?)tags?["yt_title"] ?? (string?)tags?["title"] ?? "", (string?)tags?["purl"] ?? "");
         }
         catch
         {
