@@ -28,7 +28,7 @@ internal static class TrackMatcher
         "live", "concert", "tour", "karaoke", "cover", "remix", "sped up", "speed up", "slowed", "reverb",
         "nightcore", "instrumental", "acapella", "a cappella", "8d", "bass boosted", "reaction", "tutorial",
         "lyrics", "lyric video", "music video", "official video", "mashup", "mix", "full album", "playlist",
-        "interview", "behind the scenes", "megamix", "medley", "symphonic", "orchestral", "tribute", "originally performed", "performed by", "in the style", "made famous", "rendition", "capella", "clean", "english sub", "sub", "chart", "gameplay", "sub español", "subtitulado", "legendado", "traducida", "432hz", "432 hz", "reversed", "midi", "piano version", "fan made", "preview", "teaser", "edit", "demo", "acoustic", "session"
+        "interview", "behind the scenes", "megamix", "medley", "sinfonia", "sinfonica", "orchestra", "symphony", "philharmonic", "symphonic", "orchestral", "tribute", "originally performed", "performed by", "in the style", "made famous", "rendition", "capella", "clean", "english sub", "sub", "chart", "gameplay", "sub español", "subtitulado", "legendado", "traducida", "432hz", "432 hz", "reversed", "midi", "piano version", "fan made", "preview", "teaser", "edit", "demo", "acoustic", "session"
     ];
 
     // Bracketed text on a YouTube title that doesn't indicate a different version.
@@ -41,11 +41,13 @@ internal static class TrackMatcher
     private static readonly string[] LyricExtras = ["lyric video", "lyrics", "visualizer"];
     private const double LyricExactSeconds = 1.5;
 
+    private static readonly HashSet<string> VersionSuffixWords = ["version", "edition", "mix", "edit", "recording", "release"];
+
     private static readonly string[] VersionWords =
     [
         "version", "ver", "mix", "remix", "edit", "live", "acoustic", "capella", "cappella", "instrumental", "demo",
         "cover", "karaoke", "radio", "extended", "session", "unplugged", "reprise", "rework", "bootleg", "vip", "dub",
-        "stripped", "piano", "orchestral", "sped", "slowed", "reverb", "tribute", "clean", "alternate", "alt", "take",
+        "stripped", "piano", "orchestral", "orchestra", "sinfonia", "symphony", "sped", "slowed", "reverb", "tribute", "clean", "alternate", "alt", "take",
         "mono", "stereo", "single", "album", "original", "reimagined", "re-recorded", "rerecorded"
     ];
 
@@ -73,6 +75,10 @@ internal static class TrackMatcher
             $"{first} {name} Provided to YouTube",
             $"{first} - Topic {core} {album}", // Topic uploads are filed under the album; some only surface with it
             $"{name} {artists} Provided to YouTube by",
+            // Topic/label uploads for major-label artists often only surface when the label is in the query.
+            $"{first} {core} Provided to YouTube by Universal Music Group",
+            $"{first} {core} Provided to YouTube by Sony Music Entertainment",
+            $"{first} {core} Provided to YouTube by Warner Records",
             $"{first} {name} audio",
             $"{name} {first} Topic",
             $"{first} {name}"
@@ -130,7 +136,7 @@ internal static class TrackMatcher
 
         // A re-upload by a random channel needs a stronger score than a Topic/official-channel upload.
         var top = ranked.FirstOrDefault(c => !c.NeedsTrim && c.Score >= (c.Preferred ? MinScore : MinScoreUnofficial));
-        if (top != null) return new MatchResult(top, null, ranked);
+        if (top != null) return new MatchResult(ResolveTie(track, ranked, top), null, ranked);
 
         // Nothing fits as-is. If the artist's own / a Topic upload exists but is LONGER than the track
         // (music video with intro/outro), offer it for trimming - the user supplies the timings.
@@ -151,12 +157,77 @@ internal static class TrackMatcher
         if (latin && coreTitle.Length > 0 && !ytTitle.Contains(coreTitle))
             return $"title \"{ytTitleRaw}\" doesn't contain the song name";
 
-        var spotifyText = Normalize($"{track.name} {track.album}");
+        var spotifyText = Normalize($"{track.name} {track.album} {track.artist}");
         foreach (var word in BadWords.Where(w => !SoftExtras.Contains(w)))
             if (Regex.IsMatch(ytTitle, $@"\b{Regex.Escape(word)}\b") &&
                 !Regex.IsMatch(spotifyText, $@"\b{Regex.Escape(word)}\b"))
                 return $"title \"{ytTitleRaw}\" contains \"{word}\" (a different version)";
         return null;
+    }
+
+    /// <summary>
+    ///     Two Topic uploads with the same title and length (a single and the same song on a cast recording, say) tie on
+    ///     score, and search results don't show the album. When that happens, ask YouTube for each one's album and
+    ///     artists and prefer the one that matches Spotify's. Costs a few seconds, and only for genuine ties.
+    /// </summary>
+    private static Candidate ResolveTie(TrackObj track, List<Candidate> ranked, Candidate top)
+    {
+        if (!top.Preferred || string.IsNullOrWhiteSpace(track.album)) return top;
+        // YouTube labels the same artist's uploads inconsistently ("X - Topic" in one result, "X" in another), so scores
+        // can differ by a Topic bonus even though both are the same kind of upload: compare every preferred upload of
+        // (nearly) the same length, as long as it isn't far worse.
+        var tied = ranked.Where(c => !c.NeedsTrim && c.Preferred && top.Score - c.Score <= 60
+                                     && Math.Abs((c.Duration ?? 0) - (top.Duration ?? 0)) <= 2.5).Take(3).ToList();
+        if (tied.Count < 2) return top;
+
+        var wantAlbum = Normalize(track.album);
+        var wantArtists = track.artist.Split(',').Select(Normalize).Where(a => a.Length > 0).ToList();
+        Candidate? best = null;
+        var bestPoints = 0;
+        foreach (var c in tied)
+        {
+            var meta = LookupMeta(c.Id);
+            if (meta == null) continue;
+            var points = 0;
+            if (Normalize(meta.Value.Album) == wantAlbum) points += 2;
+            var haveArtists = Normalize(meta.Value.Artist);
+            if (wantArtists.Count > 0 && wantArtists.All(a => haveArtists.Contains(a))) points += 1;
+            if (points > bestPoints) // strict: on equal points the higher-ranked upload keeps its place
+            {
+                best = c;
+                bestPoints = points;
+            }
+        }
+
+        if (best == null || best.Id == top.Id) return top;
+        UI.WriteLine("  {0} uploads tied; chose {1} because its album/artists match Spotify's ({2})", tied.Count, best.Id, track.album);
+        return best;
+    }
+
+    private static (string Album, string Artist)? LookupMeta(string videoId)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo { FileName = "yt-dlp", RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
+            foreach (var a in new[]
+                     {
+                         "https://www.youtube.com/watch?v=" + videoId, "--no-playlist", "--skip-download", "-q", "--no-warnings",
+                         "--print", "%(album)s\t%(artist)s",
+                         "--cookies-from-browser", "firefox", "--js-runtimes", "node", "--remote-components", "ejs:github"
+                     })
+                psi.ArgumentList.Add(a);
+            using var p = Process.Start(psi);
+            if (p == null) return null;
+            var output = p.StandardOutput.ReadToEnd();
+            p.StandardError.ReadToEnd();
+            p.WaitForExit();
+            var parts = output.Trim().Split('\t');
+            return parts.Length >= 2 ? (parts[0], parts[1]) : null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static Candidate? Score(JObject j, TrackObj track)
@@ -168,7 +239,7 @@ internal static class TrackMatcher
         var duration = (double?)j["duration"];
 
         var score = 0.0;
-        var spotifyText = Normalize($"{track.name} {track.album}");
+        var spotifyText = Normalize($"{track.name} {track.album} {track.artist}");
         var ytTitle = Normalize(title);
 
         double? diffSec = null;
@@ -257,7 +328,7 @@ internal static class TrackMatcher
             if (extra.Count > 0) score -= 40;
         }
 
-        var spotifyCanon = new HashSet<string>(CanonTokens($"{track.name} {track.album}"));
+        var spotifyCanon = new HashSet<string>(CanonTokens($"{track.name} {track.album} {track.artist}"));
         var ownUpload = preferred && !channel.EndsWith("- Topic", StringComparison.OrdinalIgnoreCase);
         // Artist's own video upload is an acceptable last resort (within the normal length tolerance, so a short
         // intro/outro is the worst case). Topic/audio uploads still outrank it by a wide margin.
@@ -269,6 +340,10 @@ internal static class TrackMatcher
             var extra = Normalize(m.Groups[1].Value);
             if (extra.Length == 0 || spotifyText.Contains(extra)) continue;
             if (CanonTokens(extra).All(spotifyCanon.Contains)) continue; // same words, abbreviated differently
+            // "(Oil in Water version)" on a track whose Spotify album IS "Oil in Water": the bracket just names the
+            // release Spotify already has. Ignore the generic suffix and compare what is left.
+            var named = CanonTokens(extra).Where(t => !VersionSuffixWords.Contains(t)).ToList();
+            if (named.Count > 0 && named.All(spotifyCanon.Contains)) continue;
             // "(feat. X)" / "(with X)": Spotify keeps featured artists in the artist field, not the title.
             if (Regex.IsMatch(extra, @"^(feat|ft|featuring|with)\b") || artistList.Any(a => extra.Contains(a))) continue;
             if (AllowedExtras.Any(a => extra.Contains(a))) continue;
@@ -331,15 +406,29 @@ internal static class TrackMatcher
 
     private static string Compact(string s) => Normalize(s).Replace(" ", "");
 
-    // Channel name refers to the artist ("Crywank", "alyankovic" for "Weird Al Yankovic", ...).
+    // Words a channel may add to the artist's name without being someone else ("MIKA Official", "TheWeekndVEVO").
+    private static readonly HashSet<string> GenericChannelWords =
+    [
+        "official", "vevo", "music", "records", "recordings", "tv", "channel", "topic", "band", "hq", "hd",
+        "entertainment", "productions", "media", "studios", "uk", "us", "officialmusic", "officialchannel"
+    ];
+
+    /// <summary>
+    ///     Does this channel belong to the artist? True for the same name, the name plus a generic word
+    ///     ("MIKA Official"), or a shortened form of it ("alyankovic" for "Weird Al Yankovic").
+    ///     False when the channel merely CONTAINS the name: "MikaManic89" is a fan, not MIKA.
+    /// </summary>
     private static bool IsArtistName(string channel, string artist)
     {
-        var c = Normalize(channel);
-        var a = Normalize(artist);
-        if (c.Length >= 2 && (c == a || c.Contains(a) || a.Contains(c) && c.Length >= 4)) return true;
         var cc = Compact(channel);
         var ac = Compact(artist);
-        return cc.Length >= 6 && (ac.Contains(cc) || cc.Contains(ac));
+        if (cc.Length < 2 || ac.Length < 2) return false;
+        if (cc == ac) return true;
+
+        var rest = cc.StartsWith(ac) ? cc[ac.Length..] : cc.EndsWith(ac) ? cc[..^ac.Length] : null;
+        if (rest != null && GenericChannelWords.Contains(rest)) return true;
+
+        return cc.Length >= 6 && ac.Contains(cc); // channel is a shortened form of the artist
     }
 
     private static string Clean(string s) => s.Replace("\"", " ").Replace("  ", " ").Trim();
